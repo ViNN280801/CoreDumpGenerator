@@ -10,6 +10,7 @@ CompileFlags:
   - /permissive- # Enable C++11 standard compliance
   - /Zc:twoPhase # Enable two-phase name lookup (more aggressive standard compliance)
   - /Zc:__cplusplus # Enable __cplusplus macro
+  - -D__cplusplus=201103L
   - /EHsc # Enable exception handling
 
   # Optimizations and security
