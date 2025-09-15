@@ -1,0 +1,10 @@
+# IDEs
+.vs/*
+.idea/*
+.vscode/*
+.cursor/*
+
+# Any build files
+build*/
+output*/
+out*/
