@@ -1,0 +1,56 @@
+If:
+  PathMatch: .*\.(h|hpp|c|cpp|ipp|cuh|cu|inl)
+CompileFlags:
+  Compiler: clang-cl
+  Add:
+  # C++ Standard and Warning Flags
+  - /std:c++11
+  - /W4
+  - /WX # Treat warnings as errors
+  - /permissive- # Enable C++11 standard compliance
+  - /Zc:twoPhase # Enable two-phase name lookup (more aggressive standard compliance)
+  - /Zc:__cplusplus # Enable __cplusplus macro
+  - /EHsc # Enable exception handling
+
+  # Optimizations and security
+  - /O2 # Aggressive optimizations
+  - /sdl # Enable SDL checks (security checks for Windows)
+  - /guard:cf # Enable control flow guard (for buffer overflow detection)
+  - /Zc:inline # Remove unused inline functions
+  - /Zc:strictStrings # Enable strict string checking
+  - /Zi # Enable PDB generation
+  - /DEBUG # Enable debug information
+  - /analyze # Enable static analysis (if it's available)
+
+  # Preprocessor Defines
+  - -D_WIN32
+  - -D_WIN64
+
+# Indexing configuration
+Index:
+  Background: Skip
+  StandardLibrary: Yes
+
+# Diagnostics configuration
+Diagnostics:
+  Suppress:
+  - modernize-use-trailing-return-type
+  - readability-braces-around-statements
+  # Enable clang-tidy checks
+  ClangTidy:
+    Add:
+    - readability-*
+    - performance-*
+    - modernize-*
+    - bugprone-*
+    - cppcoreguidelines-*
+    - performance-*
+    - misc-*
+    - portability-*
+    - concurrency-*
+
+# InlayHints configuration
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
