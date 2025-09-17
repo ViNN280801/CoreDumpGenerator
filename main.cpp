@@ -95,8 +95,21 @@ main()
   std::cout << "Dump directory: " << CoreDumpGenerator::getDumpDirectory() << "\n";
   std::cout << "Current dump type: " << DumpFactory::getDescription(CoreDumpGenerator::getCurrentDumpType()) << "\n";
 
+  // Test admin privilege checking
+  std::cout << "\n=== Admin Privilege Check ===\n";
+  bool isAdmin = CoreDumpGenerator::isAdminPrivileges();
+  std::cout << "Running with admin privileges: " << (isAdmin ? "YES" : "NO") << "\n";
+
+  // Test logging with different privilege levels
+  std::cout << "\n=== Logging Test ===\n";
+  std::cout << "Testing logging with sensitive information:\n";
+
+  // This will show different sanitization based on admin privileges
+  CoreDumpGenerator::generateDump("Test dump for admin privilege logging demonstration");
+
   std::cout << "\n=== Available Dump Types ===\n";
   std::cout << "=== Basic Mini Dumps (64KB) ===\n";
+#if DUMP_CREATOR_WINDOWS
   std::cout << "1. MINI_DUMP_NORMAL\n";
   std::cout << "2. MINI_DUMP_WITHOUT_OPTIONAL_DATA\n";
   std::cout << "3. MINI_DUMP_IGNORE_INACCESSIBLE_MEMORY\n";
@@ -130,6 +143,13 @@ main()
   std::cout << "23. KERNEL_SMALL_DUMP\n";
   std::cout << "24. KERNEL_AUTOMATIC_DUMP\n";
   std::cout << "25. KERNEL_ACTIVE_DUMP\n";
+#else
+  std::cout << "1. CORE_DUMP_FULL\n";
+  std::cout << "2. CORE_DUMP_KERNEL_ONLY\n";
+  std::cout << "3. CORE_DUMP_USER_ONLY\n";
+  std::cout << "4. CORE_DUMP_COMPRESSED\n";
+  std::cout << "5. CORE_DUMP_FILTERED\n";
+#endif
 
   std::cout << "0. Exit\n";
   std::cout << "\nSelect option: ";
@@ -143,9 +163,16 @@ main()
     return 0;
   }
 
-  if(choice >= 1 && choice <= 25)
+#if DUMP_CREATOR_WINDOWS
+  const int maxChoice = 25;
+#else
+  const int maxChoice = 5;
+#endif
+
+  if(choice >= 1 && choice <= maxChoice)
   {
     std::vector<DumpType> dumpTypes = {
+#if DUMP_CREATOR_WINDOWS
       DumpType::MINI_DUMP_NORMAL,                            // 1
       DumpType::MINI_DUMP_WITHOUT_OPTIONAL_DATA,             // 2
       DumpType::MINI_DUMP_IGNORE_INACCESSIBLE_MEMORY,        // 3
@@ -171,6 +198,13 @@ main()
       DumpType::KERNEL_SMALL_DUMP,                           // 23
       DumpType::KERNEL_AUTOMATIC_DUMP,                       // 24
       DumpType::KERNEL_ACTIVE_DUMP                           // 25
+#else
+      DumpType::CORE_DUMP_FULL,        // 1
+      DumpType::CORE_DUMP_KERNEL_ONLY, // 2
+      DumpType::CORE_DUMP_USER_ONLY,   // 3
+      DumpType::CORE_DUMP_COMPRESSED,  // 4
+      DumpType::CORE_DUMP_FILTERED,    // 5
+#endif
     };
 
     CoreDumpGenerator::setDumpType(dumpTypes[choice - 1]);

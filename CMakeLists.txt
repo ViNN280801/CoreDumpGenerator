@@ -29,7 +29,7 @@ message(STATUS "CMAKE_CURRENT_LIST_DIR: ${CMAKE_CURRENT_LIST_DIR}")
 
 if(MSVC)
     # Maximum debugging information and warnings
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX /EHsc /utf-8")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX /EHsc /utf-8 /Zc:__cplusplus")
 
     # Debug configuration - maximum debug info
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Od /Zi /DEBUG /JMC /bigobj")
@@ -55,7 +55,6 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 add_executable(${PROJECT_NAME}
-    CoreDumpGenerator.cpp
     main.cpp
 )
 
