@@ -2312,7 +2312,7 @@ CoreDumpGenerator::_windowsExceptionHandler(EXCEPTION_POINTERS *pExInfo) noexcep
     sa.nLength             = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle      = FALSE;
 
-    // Create a security descriptor that only allows owner access
+    // Create a security descriptor that allows proper access for deletion
     SECURITY_DESCRIPTOR sd = {};
     if(InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION))
     {
@@ -2330,20 +2330,37 @@ CoreDumpGenerator::_windowsExceptionHandler(EXCEPTION_POINTERS *pExInfo) noexcep
         }
       }
 
-      if(ownerSid && SetSecurityDescriptorOwner(&sd, ownerSid, FALSE))
+      // Get Administrators group SID
+      PSID administratorsGroup             = nullptr;
+      SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+      if(AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0,
+                                  0, &administratorsGroup))
       {
-        // Create DACL with owner read/write access only
-        PACL dacl      = nullptr;
-        DWORD daclSize = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + GetLengthSid(ownerSid);
-        dacl           = static_cast<PACL>(LocalAlloc(LPTR, daclSize));
-        if(dacl && InitializeAcl(dacl, daclSize, ACL_REVISION))
+        if(ownerSid && SetSecurityDescriptorOwner(&sd, ownerSid, FALSE))
         {
-          if(AddAccessAllowedAce(dacl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE, ownerSid))
+          // Create DACL with full access for owner and administrators
+          PACL dacl = nullptr;
+          DWORD daclSize
+            = sizeof(ACL) + 2 * sizeof(ACCESS_ALLOWED_ACE) + GetLengthSid(ownerSid) + GetLengthSid(administratorsGroup);
+          dacl = static_cast<PACL>(LocalAlloc(LPTR, daclSize));
+
+          if(dacl && InitializeAcl(dacl, daclSize, ACL_REVISION))
           {
-            SetSecurityDescriptorDacl(&sd, TRUE, dacl, FALSE);
-            sa.lpSecurityDescriptor = &sd;
+            // Add full access for owner
+            if(AddAccessAllowedAce(dacl, ACL_REVISION, FILE_ALL_ACCESS, ownerSid))
+            {
+              // Add full access for administrators
+              if(AddAccessAllowedAce(dacl, ACL_REVISION, FILE_ALL_ACCESS, administratorsGroup))
+              {
+                SetSecurityDescriptorDacl(&sd, TRUE, dacl, FALSE);
+                sa.lpSecurityDescriptor = &sd;
+              }
+            }
           }
         }
+
+        // Clean up administrators SID
+        if(administratorsGroup) FreeSid(administratorsGroup);
       }
     }
 
@@ -2446,8 +2463,65 @@ CoreDumpGenerator::_createWindowsDump(std::string const &filename, DumpConfigura
     // Convert string to wide string for Windows API
     std::wstring wfilename(filename.begin(), filename.end());
 
+    // Create security attributes for proper file access
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength             = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle      = FALSE;
+
+    // Create a security descriptor that allows proper access for deletion
+    SECURITY_DESCRIPTOR sd = {};
+    if(InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION))
+    {
+      // Set owner to current user
+      PSID ownerSid      = nullptr;
+      DWORD ownerSidSize = 0;
+      GetTokenInformation(GetCurrentProcessToken(), TokenUser, nullptr, 0, &ownerSidSize);
+      if(ownerSidSize > 0)
+      {
+        std::vector<BYTE> tokenInfo(ownerSidSize);
+        if(GetTokenInformation(GetCurrentProcessToken(), TokenUser, tokenInfo.data(), ownerSidSize, &ownerSidSize))
+        {
+          TOKEN_USER *tokenUser = reinterpret_cast<TOKEN_USER *>(tokenInfo.data());
+          ownerSid              = tokenUser->User.Sid;
+        }
+      }
+
+      // Get Administrators group SID
+      PSID administratorsGroup             = nullptr;
+      SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+      if(AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0,
+                                  0, &administratorsGroup))
+      {
+        if(ownerSid && SetSecurityDescriptorOwner(&sd, ownerSid, FALSE))
+        {
+          // Create DACL with full access for owner and administrators
+          PACL dacl = nullptr;
+          DWORD daclSize
+            = sizeof(ACL) + 2 * sizeof(ACCESS_ALLOWED_ACE) + GetLengthSid(ownerSid) + GetLengthSid(administratorsGroup);
+          dacl = static_cast<PACL>(LocalAlloc(LPTR, daclSize));
+
+          if(dacl && InitializeAcl(dacl, daclSize, ACL_REVISION))
+          {
+            // Add full access for owner
+            if(AddAccessAllowedAce(dacl, ACL_REVISION, FILE_ALL_ACCESS, ownerSid))
+            {
+              // Add full access for administrators
+              if(AddAccessAllowedAce(dacl, ACL_REVISION, FILE_ALL_ACCESS, administratorsGroup))
+              {
+                SetSecurityDescriptorDacl(&sd, TRUE, dacl, FALSE);
+                sa.lpSecurityDescriptor = &sd;
+              }
+            }
+          }
+        }
+
+        // Clean up administrators SID
+        if(administratorsGroup) FreeSid(administratorsGroup);
+      }
+    }
+
     // Open file for writing dump with proper error handling
-    HANDLE hFile = CreateFileW(wfilename.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFile = CreateFileW(wfilename.c_str(), GENERIC_WRITE, 0, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if(hFile == INVALID_HANDLE_VALUE)
     {
       DWORD error = GetLastError();
