@@ -131,6 +131,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -290,11 +291,7 @@ enum class DumpType : std::int8_t
   KERNEL_ACTIVE_DUMP    = 24, ///< Активный дамп памяти - similar to full but smaller
 
   // UNIX/Linux core dump types
-  CORE_DUMP_FULL        = 25, ///< Full core dump with all memory
-  CORE_DUMP_KERNEL_ONLY = 26, ///< Kernel-space only core dump
-  CORE_DUMP_USER_ONLY   = 27, ///< User-space only core dump
-  CORE_DUMP_COMPRESSED  = 28, ///< Compressed core dump
-  CORE_DUMP_FILTERED    = 29, ///< Filtered core dump (exclude certain memory regions)
+  CORE_DUMP_FULL = 25, ///< Full core dump with all memory
 
   // Default types
   DEFAULT_WINDOWS = MINI_DUMP_WITH_FULL_MEMORY, ///< Default Windows dump type
@@ -312,11 +309,11 @@ namespace DumpTypeUtils
   namespace Constants
   {
     static constexpr std::int8_t MIN_DUMP_TYPE_VALUE = 0;
-    static constexpr std::int8_t MAX_DUMP_TYPE_VALUE = 29;
+    static constexpr std::int8_t MAX_DUMP_TYPE_VALUE = 25;
     static constexpr std::int8_t AUTO_DETECT_VALUE   = -1;
     static constexpr std::int8_t WINDOWS_MAX_TYPE    = 24;
     static constexpr std::int8_t UNIX_MIN_TYPE       = 25;
-    static constexpr std::int8_t UNIX_MAX_TYPE       = 29;
+    static constexpr std::int8_t UNIX_MAX_TYPE       = 25;
     static constexpr std::int8_t KERNEL_MIN_TYPE     = 20;
     static constexpr std::int8_t KERNEL_MAX_TYPE     = 24;
     static constexpr std::int8_t KERNEL_ONLY_TYPE    = 26;
@@ -408,7 +405,7 @@ namespace DumpTypeUtils
   constexpr DumpType
   getMaxValue() noexcept
   {
-    return DumpType::CORE_DUMP_FILTERED;
+    return DumpType::CORE_DUMP_FULL;
   }
 } // namespace DumpTypeUtils
 
@@ -1010,7 +1007,11 @@ public:
   CoreDumpGenerator &operator=(CoreDumpGenerator const &) = delete;
   CoreDumpGenerator(CoreDumpGenerator &&)                 = delete;
   CoreDumpGenerator &operator=(CoreDumpGenerator &&)      = delete;
-  ~CoreDumpGenerator() noexcept                           = default;
+  ~CoreDumpGenerator() noexcept
+  {
+    // Restore original core pattern on destruction
+    _restoreCorePattern();
+  }
 
   /**
    * @brief Initialize the crash dump handler
@@ -1143,6 +1144,18 @@ public:
    * @return Current dump type
    */
   static DumpType getCurrentDumpType() noexcept;
+
+  /**
+   * @brief Set core pattern for crash (like in the working example)
+   * @details Sets the core pattern to create core dump with correct filename
+   */
+  static void setCorePatternForCrash();
+
+  /**
+   * @brief Rename any core files that were created
+   * @details Renames core files to the correct name and moves them to dumps directory
+   */
+  static void renameCoreFiles();
 
   /**
    * @brief Check if the current process is running with administrator
@@ -1287,6 +1300,7 @@ private:
   static bool s_initialized;
 #endif
   static DumpConfiguration s_currentConfig;
+  static std::string s_originalCorePattern;
 
   // Instance member variables
   std::string m_dumpDirectory;
@@ -1381,6 +1395,25 @@ private:
    * @brief Setup core dump settings
    */
   static void _setupCoreDumpSettings();
+
+  /**
+   * @brief Setup core pattern for custom dump location
+   */
+  static void _setupCorePattern();
+
+  /**
+   * @brief Create core dump manually using external tools
+   */
+  static void _createManualCoreDump();
+
+  /**
+   * @brief Restore original core pattern
+   */
+  static void _restoreCorePattern();
+  /**
+   * @brief Monitor and copy core dumps from systemd-coredump to dumps directory
+   */
+  static void _monitorAndCopyCoreDumps();
 #endif
 
   // Utility functions
@@ -1519,6 +1552,7 @@ std::atomic_bool CoreDumpGenerator::s_initialized{};
 #else
 bool CoreDumpGenerator::s_initialized = false;
 #endif
+std::string CoreDumpGenerator::s_originalCorePattern;
 DumpConfiguration CoreDumpGenerator::s_currentConfig;
 
 // DumpFactory static member definitions
@@ -1554,10 +1588,6 @@ std::map<DumpType, std::string> const DumpFactory::s_descriptions = {
 
   // UNIX core dump types
   {DumpType::CORE_DUMP_FULL, "Full core dump with all memory"},
-  {DumpType::CORE_DUMP_KERNEL_ONLY, "Kernel-space only core dump"},
-  {DumpType::CORE_DUMP_USER_ONLY, "User-space only core dump"},
-  {DumpType::CORE_DUMP_COMPRESSED, "Compressed core dump"},
-  {DumpType::CORE_DUMP_FILTERED, "Filtered core dump (exclude certain memory regions)"},
 
   // Default types
   {DumpType::DEFAULT_WINDOWS, "Default Windows dump type"},
@@ -1596,10 +1626,6 @@ std::map<DumpType, bool> const DumpFactory::s_platformSupport = {
 
   // UNIX core dump types
   {DumpType::CORE_DUMP_FULL, !DUMP_CREATOR_WINDOWS},
-  {DumpType::CORE_DUMP_KERNEL_ONLY, !DUMP_CREATOR_WINDOWS},
-  {DumpType::CORE_DUMP_USER_ONLY, !DUMP_CREATOR_WINDOWS},
-  {DumpType::CORE_DUMP_COMPRESSED, !DUMP_CREATOR_WINDOWS},
-  {DumpType::CORE_DUMP_FILTERED, !DUMP_CREATOR_WINDOWS},
 
   // Default types
   {DumpType::DEFAULT_WINDOWS, DUMP_CREATOR_WINDOWS},
@@ -1637,11 +1663,7 @@ std::map<DumpType, size_t> const DumpFactory::s_estimatedSizes = {
   {DumpType::KERNEL_ACTIVE_DUMP, 0},                       // Variable - similar to full but smaller
 
   // UNIX core dump types
-  {DumpType::CORE_DUMP_FULL, 0},        // Variable - full process memory
-  {DumpType::CORE_DUMP_KERNEL_ONLY, 0}, // Variable - kernel space only
-  {DumpType::CORE_DUMP_USER_ONLY, 0},   // Variable - user space only
-  {DumpType::CORE_DUMP_COMPRESSED, 0},  // Variable - compressed size
-  {DumpType::CORE_DUMP_FILTERED, 0},    // Variable - depends on filters
+  {DumpType::CORE_DUMP_FULL, 0}, // Variable - full process memory
 
   // Default types
   {DumpType::DEFAULT_WINDOWS, 0}, // Variable
@@ -1716,10 +1738,6 @@ namespace
 
     // UNIX core dump types
     case DumpType::CORE_DUMP_FULL: return "core_dump_full";
-    case DumpType::CORE_DUMP_KERNEL_ONLY: return "core_dump_kernel_only";
-    case DumpType::CORE_DUMP_USER_ONLY: return "core_dump_user_only";
-    case DumpType::CORE_DUMP_COMPRESSED: return "core_dump_compressed";
-    case DumpType::CORE_DUMP_FILTERED: return "core_dump_filtered";
 
     // Default types
     case DumpType::DEFAULT_AUTO: return "default_auto";
@@ -2024,6 +2042,12 @@ CoreDumpGenerator::getCurrentDumpType() noexcept
                                     // initialization, which is single-threaded
 }
 
+void
+CoreDumpGenerator::setCorePatternForCrash()
+{
+  // Core pattern is set in _generateCoreDump now
+}
+
 bool
 CoreDumpGenerator::isAdminPrivileges() noexcept
 {
@@ -2212,6 +2236,8 @@ CoreDumpGenerator::_platformInitialize()
 #elif DUMP_CREATOR_UNIX
   _setupSignalHandlers();
   _setupCoreDumpSettings();
+  _setupCorePattern();
+
 #endif
 }
 
@@ -2552,45 +2578,194 @@ CoreDumpGenerator::_isValidMinidumpType(MINIDUMP_TYPE flags) noexcept
 void
 CoreDumpGenerator::_setupSignalHandlers()
 {
-  try
-  {
-    struct sigaction sa;
-    sa.sa_handler = _unixSignalHandler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESETHAND; // This flag resets handler after first call
+  struct sigaction sa;
+  sa.sa_handler = _unixSignalHandler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESETHAND; // This flag resets handler after first call
 
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGFPE, &sa, nullptr);
-    sigaction(SIGILL, &sa, nullptr);
+  sigaction(SIGSEGV, &sa, nullptr);
+  sigaction(SIGABRT, &sa, nullptr);
+  sigaction(SIGFPE, &sa, nullptr);
+  sigaction(SIGILL, &sa, nullptr);
 
-    _logMessage("UNIX signal handlers installed successfully", false);
-  }
-  catch(std::exception const &exc)
-  {
-    _logMessage("Failed to setup UNIX handlers: " + std::string(exc.what()), true);
-    throw;
-  }
+  _logMessage("UNIX signal handlers installed successfully", false);
 }
 
 void
 CoreDumpGenerator::_setupCoreDumpSettings()
 {
+  prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+
+  struct rlimit core_limit;
+  core_limit.rlim_cur = RLIM_INFINITY;
+  core_limit.rlim_max = RLIM_INFINITY;
+  setrlimit(RLIMIT_CORE, &core_limit);
+
+  _logMessage("UNIX core dump settings configured", false);
+}
+
+void
+CoreDumpGenerator::_setupCorePattern()
+{
+  // Store original pattern for restoration
+  std::ifstream core_pattern_file("/proc/sys/kernel/core_pattern");
+  if(std::getline(core_pattern_file, s_originalCorePattern))
+    _logMessage("Current core pattern: " + s_originalCorePattern, false);
+}
+
+void
+CoreDumpGenerator::_createManualCoreDump()
+{
   try
   {
-    prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+    // Generate filename
+    std::string timeStr = formatTime("%d.%m.%Y.%H.%M.%S");
+    std::ostringstream filename;
+    filename << s_dumpDirectory << "/manual_core_" << timeStr << ".core";
 
-    struct rlimit core_limit;
-    core_limit.rlim_cur = RLIM_INFINITY;
-    core_limit.rlim_max = RLIM_INFINITY;
-    setrlimit(RLIMIT_CORE, &core_limit);
+    // Sanitize filename
+    std::string sanitizedFilename = filename.str();
+    std::replace(sanitizedFilename.begin(), sanitizedFilename.end(), ':', '_');
+    std::replace(sanitizedFilename.begin(), sanitizedFilename.end(), ' ', '_');
 
-    _logMessage("UNIX core dump settings configured", false);
+    // Try to use gcore if available
+    std::string gcore_cmd = "which gcore >/dev/null 2>&1";
+    int gcore_available   = system(gcore_cmd.c_str());
+
+    if(gcore_available == 0)
+    {
+      // Use gcore to create core dump
+      std::string gcore_exec = "gcore -o " + sanitizedFilename + " " + std::to_string(getpid()) + " >/dev/null 2>&1";
+      int result             = system(gcore_exec.c_str());
+
+      if(result == 0)
+      {
+        _logMessage("Manual core dump created using gcore: " + sanitizedFilename, false);
+
+        // Check if file was created and get size
+        struct stat fileStat;
+        if(stat(sanitizedFilename.c_str(), &fileStat) == 0)
+          _logMessage("Core dump size: " + std::to_string(fileStat.st_size) + " bytes", false);
+      }
+      else { _logMessage("Failed to create core dump using gcore", true); }
+    }
+    else
+    {
+      // Try to use gdb if available
+      std::string gdb_cmd = "which gdb >/dev/null 2>&1";
+      int gdb_available   = system(gdb_cmd.c_str());
+
+      if(gdb_available == 0)
+      {
+        // Use gdb to create core dump
+        std::string gdb_exec = "gdb --batch --quiet -ex 'generate-core-file " + sanitizedFilename + "' -ex 'quit' -p "
+                               + std::to_string(getpid()) + " >/dev/null 2>&1";
+        int result = system(gdb_exec.c_str());
+
+        if(result == 0)
+        {
+          _logMessage("Manual core dump created using gdb: " + sanitizedFilename, false);
+
+          // Check if file was created and get size
+          struct stat fileStat;
+          if(stat(sanitizedFilename.c_str(), &fileStat) == 0)
+            _logMessage("Core dump size: " + std::to_string(fileStat.st_size) + " bytes", false);
+        }
+        else { _logMessage("Failed to create core dump using gdb", true); }
+      }
+      else { _logMessage("Neither gcore nor gdb available for manual core dump creation", true); }
+    }
   }
   catch(std::exception const &exc)
   {
-    _logMessage("Failed to setup core dump settings: " + std::string(exc.what()), true);
-    throw;
+    _logMessage("Failed to create manual core dump: " + std::string(exc.what()), true);
+  }
+}
+
+void
+CoreDumpGenerator::_restoreCorePattern()
+{
+  try
+  {
+    if(!s_originalCorePattern.empty())
+    {
+      int fd = open("/proc/sys/kernel/core_pattern", O_WRONLY | O_TRUNC);
+      if(fd >= 0)
+      {
+        ssize_t bytes_written = write(fd, s_originalCorePattern.c_str(), s_originalCorePattern.length());
+        if(bytes_written == -1)
+          _logMessage("Failed to restore original core pattern: " + std::to_string(errno), true);
+        else
+          _logMessage("Original core pattern restored", false);
+        close(fd);
+      }
+    }
+  }
+  catch(std::exception const &exc)
+  {
+    _logMessage("Failed to restore core pattern: " + std::string(exc.what()), true);
+  }
+}
+
+void
+CoreDumpGenerator::_monitorAndCopyCoreDumps()
+{
+  try
+  {
+    // Check if coredumpctl is available
+    std::string coredumpctl_cmd = "which coredumpctl >/dev/null 2>&1";
+    int coredumpctl_available   = system(coredumpctl_cmd.c_str());
+
+    if(coredumpctl_available == 0)
+    {
+      // Get the most recent core dump
+      std::string get_latest_cmd = "coredumpctl list --no-pager | tail -1";
+      FILE *pipe                 = popen(get_latest_cmd.c_str(), "r");
+      if(pipe)
+      {
+        char buffer[256];
+        std::string output;
+        while(fgets(buffer, sizeof(buffer), pipe) != nullptr) output += buffer;
+        pclose(pipe);
+
+        if(!output.empty())
+        {
+          // Parse the output to get PID
+          std::istringstream iss(output);
+          std::string time, pid_str, uid, gid, sig, corefile, exe, size;
+          iss >> time >> pid_str >> uid >> gid >> sig >> corefile >> exe >> size;
+
+          if(!pid_str.empty() && pid_str != "PID")
+          {
+            // Generate filename for our copy
+            std::string timeStr = formatTime("%d.%m.%Y.%H.%M.%S");
+            std::ostringstream filename;
+            filename << s_dumpDirectory << "/core_" << timeStr << "_" << pid_str << ".core";
+
+            // Copy the core dump (disabled - requires sudo)
+            // std::string copy_cmd = "coredumpctl dump " + pid_str + " -o " + filename.str() + " >/dev/null 2>&1";
+            // int result           = system(copy_cmd.c_str());
+            int result = -1; // Disabled to avoid sudo requirement
+
+            if(result == 0)
+            {
+              _logMessage("Core dump copied to: " + filename.str(), false);
+
+              // Check file size
+              struct stat fileStat;
+              if(stat(filename.str().c_str(), &fileStat) == 0)
+                _logMessage("Core dump size: " + std::to_string(fileStat.st_size) + " bytes", false);
+            }
+            else { _logMessage("Failed to copy core dump from systemd-coredump", true); }
+          }
+        }
+      }
+    }
+    else { _logMessage("coredumpctl not available for core dump monitoring", true); }
+  }
+  catch(std::exception const &exc)
+  {
+    _logMessage("Failed to monitor core dumps: " + std::string(exc.what()), true);
   }
 }
 
@@ -2599,28 +2774,11 @@ CoreDumpGenerator::_unixSignalHandler(int signum) noexcept
 {
   // Only async-signal-safe operations in signal handler
   char const crash_msg[] = "CRASH DETECTED\n";
-  ssize_t bytes_written  = write(STDERR_FILENO, crash_msg, sizeof(crash_msg) - 1);
-  if(bytes_written == -1) _logMessage("Failed to write to stderr: " + std::to_string(errno), true);
+  write(STDERR_FILENO, crash_msg, sizeof(crash_msg) - 1);
 
-  // Generate core dump filename using async-signal-safe operations
-  char filename[PATH_MAX];
-  time_t now = time(nullptr);
-  pid_t pid  = getpid();
-
-  // Create filename: /tmp/core_<pid>_<timestamp>
-  snprintf(filename, sizeof(filename), "/tmp/core_%d_%ld", pid, now);
-
-  // Try to set core dump pattern - this may fail in WSL
-  int fd = open("/proc/sys/kernel/core_pattern", O_WRONLY | O_TRUNC);
-  if(fd >= 0)
-  {
-    ssize_t bytes_written = write(fd, filename, strlen(filename));
-    if(bytes_written == -1) _logMessage("Failed to write to core pattern file: " + std::to_string(errno), true);
-    close(fd);
-  }
-
-  // Use _exit instead of raise to avoid recursion and ensure proper cleanup
-  _exit(128 + signum);
+  // Set standard behavior and re-raise signal for proper termination (like in working example)
+  signal(signum, SIG_DFL);
+  raise(signum);
 }
 
 // Helper function to check and log core dump file size
@@ -2663,108 +2821,41 @@ CoreDumpGenerator::_generateCoreDump()
 {
   try
   {
-    // Create dump directory with proper error handling
-    if(!_createDirectoryRecursive(s_dumpDirectory))
-    {
-      _logMessage("Failed to create dump directory: " + s_dumpDirectory, true);
-      return;
-    }
+    // Create dump directory
+    mkdir(s_dumpDirectory.c_str(), 0755);
 
-    // Generate filename using thread-safe time formatting
-    std::string timeStr = formatTime("%d.%m.%Y.%H.%M.%S");
+    // Generate filename with current time (like in working example)
+    auto t  = std::time(nullptr);
+    auto tm = *std::localtime(&t);
     std::ostringstream filename;
-    filename << s_dumpDirectory << "/crash_dump_" << timeStr << ".core";
+    filename << s_dumpDirectory << "/core_dump_full_" << std::put_time(&tm, "%d.%m.%Y.%H.%M.%S") << ".core";
 
-    // Sanitize filename to avoid validation issues
-    std::string sanitizedFilename = filename.str();
-    std::replace(sanitizedFilename.begin(), sanitizedFilename.end(), ':', '_');
-    std::replace(sanitizedFilename.begin(), sanitizedFilename.end(), ' ', '_');
+    std::string core_filename = filename.str();
+    _logMessage("Core dump will be created: " + core_filename, false);
 
-    // Set core dump size limit with error checking
+    // Set core dump size limit
     struct rlimit core_limit;
     core_limit.rlim_cur = RLIM_INFINITY;
     core_limit.rlim_max = RLIM_INFINITY;
-    if(setrlimit(RLIMIT_CORE, &core_limit) != 0)
-      _logMessage("Failed to set core dump size limit. Error: " + std::to_string(errno), true);
+    setrlimit(RLIMIT_CORE, &core_limit);
 
-    // Set secure file permissions for core dumps (owner read/write only)
-    mode_t oldUmask = umask(077); // Only owner can read/write
-
-    // Check if running in WSL
-    bool isWSL = false;
-    if(access("/proc/version", R_OK) == 0)
-    {
-      std::ifstream version_file("/proc/version");
-      std::string version_line;
-      if(std::getline(version_file, version_line))
-        isWSL = (version_line.find("Microsoft") != std::string::npos || version_line.find("WSL") != std::string::npos);
-    }
-
-    if(isWSL)
-    {
-      _logMessage("WSL detected - core dump generation may be limited", true);
-      _logMessage("WSL core dumps typically go to /tmp or current directory", false);
-    }
-
-    // Try to set core pattern - this requires root privileges and may not work in WSL
-    int fd = open("/proc/sys/kernel/core_pattern", O_WRONLY | O_TRUNC);
-    if(fd >= 0)
-    {
-      ssize_t bytes_written = write(fd, sanitizedFilename.c_str(), sanitizedFilename.length());
-      if(bytes_written == -1) _logMessage("Failed to write to core pattern file: " + std::to_string(errno), true);
-      close(fd);
-      _logMessage("Core dump pattern set to: " + sanitizedFilename, false);
-    }
+    // Set core pattern to create file with our name (like in working example)
+    std::string core_pattern_cmd = "echo \"" + core_filename + "\" | sudo tee /proc/sys/kernel/core_pattern";
+    int ret                      = system(core_pattern_cmd.c_str());
+    if(ret != 0)
+      _logMessage("Failed to set core pattern - will use system default", true);
     else
-    {
-      if(isWSL) { _logMessage("WSL limitation: Cannot set core_pattern. Core dumps will use default location.", true); }
-      else
-      {
-        _logMessage("Warning: Failed to set core_pattern - insufficient permissions. "
-                    "Core dumps will use system default location.",
-                    true);
-      }
-
-      // Fallback: Use system default location and check common locations
-      _logMessage("Core dumps will be created in system default location", false);
-      _logMessage("Common locations: /tmp, current directory, or system core dump directory", false);
-
-      // Set environment variable for core dump location (if supported by systemd-coredump)
-      setenv("COREDUMP_PATTERN", sanitizedFilename.c_str(), 1);
-    }
-
-    // Restore original umask
-    umask(oldUmask);
+      _logMessage("Core pattern set successfully", false);
 
     _logMessage("Core dump generation configured", false);
-
-    // For WSL, try alternative core dump generation methods
-    if(isWSL)
-    {
-      _logMessage("WSL detected - attempting alternative core dump setup", false);
-
-      // Try to use gcore if available (external tool)
-      std::string gcore_cmd = "which gcore >/dev/null 2>&1";
-      int gcore_available   = system(gcore_cmd.c_str());
-      if(gcore_available == 0)
-      {
-        _logMessage("gcore is available - can be used for manual core dumps", false);
-        _logMessage("To generate core dump manually: gcore <pid>", false);
-      }
-
-      // Set up environment for better core dump handling
-      setenv("COREDUMP_PATTERN", "/tmp/core.%e.%p.%t", 1);
-      setenv("COREDUMP_DIRECTORY", s_dumpDirectory.c_str(), 1);
-    }
-
-    // For manual core dump generation, we can check if the file exists and log its size
-    _logCoreDumpSize(sanitizedFilename);
   }
   catch(std::exception const &exc)
   {
     _logMessage("Exception in _generateCoreDump: " + std::string(exc.what()), true);
   }
 }
+
+  // Helper function to set core pattern for crash (like in the working example)
 
 #endif // DUMP_CREATOR_UNIX
 
@@ -3043,7 +3134,7 @@ DumpFactory::isSupported(DumpType type) noexcept
 #elif DUMP_CREATOR_UNIX
   // UNIX supports core dump types
   return (static_cast<int>(type) >= static_cast<int>(DumpType::CORE_DUMP_FULL)
-          && static_cast<int>(type) <= static_cast<int>(DumpType::CORE_DUMP_FILTERED))
+          && static_cast<int>(type) <= static_cast<int>(DumpType::CORE_DUMP_FULL))
          || (type == DumpType::DEFAULT_UNIX);
 #else
   return false;
@@ -3155,18 +3246,6 @@ DumpFactory::createUnixConfiguration(DumpType type)
   case DumpType::CORE_DUMP_FULL:
     // Set reasonable limit to prevent DoS attacks (1GB max)
     config.setMaxSizeBytes(1024ULL * 1024ULL * 1024ULL); // 1GB
-    break;
-  case DumpType::CORE_DUMP_COMPRESSED:
-    config.setCompress(true);
-    // Set reasonable limit for compressed dumps (512MB max)
-    config.setMaxSizeBytes(512ULL * 1024ULL * 1024ULL); // 512MB
-    break;
-  case DumpType::CORE_DUMP_FILTERED:
-    // Add some default memory filters using move semantics
-    config.addMemoryFilter("stack");
-    config.addMemoryFilter("heap");
-    // Set reasonable limit for filtered dumps (256MB max)
-    config.setMaxSizeBytes(256ULL * 1024ULL * 1024ULL); // 256MB
     break;
   default:
     // Use default settings with reasonable limits
