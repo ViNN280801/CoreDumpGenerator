@@ -131,7 +131,6 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
-#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -1009,8 +1008,10 @@ public:
   CoreDumpGenerator &operator=(CoreDumpGenerator &&)      = delete;
   ~CoreDumpGenerator() noexcept
   {
+#if DUMP_CREATOR_UNIX
     // Restore original core pattern on destruction
     _restoreCorePattern();
+#endif
   }
 
   /**
