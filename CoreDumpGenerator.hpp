@@ -227,9 +227,14 @@
   #include <errno.h>
   #include <fcntl.h>
   #include <fstream> // for std::ofstream in _generateCoreDump()
+  #include <grp.h>   // for getgrnam, group membership checks
   #include <limits.h>
+  #include <pthread.h>
+  #include <signal.h>
+  #include <sys/inotify.h> // For instant systemd-coredump monitoring
   #include <sys/prctl.h>
   #include <sys/resource.h>
+  #include <sys/select.h> // For select() in inotify loop
   #include <sys/stat.h>
   #include <sys/types.h>
   #include <sys/wait.h>
@@ -1009,6 +1014,13 @@ public:
   ~CoreDumpGenerator() noexcept
   {
 #if DUMP_CREATOR_UNIX
+    // Stop instant systemd monitor thread
+    if(s_monitorThread.joinable())
+    {
+      s_monitorThreadShouldStop.store(true, std::memory_order_release);
+      s_monitorThread.join();
+    }
+
     // Restore original core pattern on destruction
     _restoreCorePattern();
 #endif
@@ -1180,6 +1192,59 @@ public:
    */
   static bool isAdminPrivileges() noexcept;
 
+  /**
+   * @brief Register a custom signal handler for graceful shutdown signals
+   *
+   * This method allows registering custom handlers for signals like SIGINT, SIGTERM, SIGHUP
+   * that should trigger graceful shutdown rather than crash dumps. The handler will be called
+   * before the default crash handling behavior.
+   *
+   * @param signum Signal number to register handler for
+   * @param handler Function pointer to the custom handler
+   * @return true if registration was successful, false otherwise
+   * @note This method is thread-safe
+   * @note Only works on UNIX systems (Windows uses console handlers instead)
+   * @note Handler should be async-signal-safe
+   *
+   * @complexity O(1) - constant time operation
+   * @thread_safety This function is thread-safe and may be called concurrently
+   * @exception_safety No-throw guarantee
+   *
+   * @since Version 1.1
+   */
+  static bool registerCustomSignalHandler(int signum, void (*handler)(int)) noexcept;
+
+#if DUMP_CREATOR_WINDOWS
+  /**
+   * @brief Register a custom console handler for Windows graceful shutdown
+   *
+   * This method allows registering a custom console control handler for Windows
+   * that will be called for console events like Ctrl+C, Ctrl+Break, etc.
+   *
+   * @param handler Function pointer to the custom console handler
+   * @return true if registration was successful, false otherwise
+   * @note This method is thread-safe
+   * @note Only works on Windows systems
+   * @note Handler should be async-signal-safe
+   *
+   * @complexity O(1) - constant time operation
+   * @thread_safety This function is thread-safe and may be called concurrently
+   * @exception_safety No-throw guarantee
+   *
+   * @since Version 1.1
+   */
+  static bool registerCustomConsoleHandler(BOOL(WINAPI *handler)(DWORD)) noexcept;
+#endif
+
+#if DUMP_CREATOR_UNIX
+  /**
+   * @brief POSIX-safe console-style graceful shutdown registration.
+   * Blocks SIGINT/SIGTERM/SIGHUP in the caller and starts an internal sigwait thread
+   * that invokes the provided handler() in a normal thread context.
+   */
+  static bool registerCustomConsoleHandler(void (*handler)()) noexcept;
+#endif
+
   // Instance methods for better encapsulation
   /**
    * @brief Get the dump directory for this instance
@@ -1303,6 +1368,24 @@ private:
   static DumpConfiguration s_currentConfig;
   static std::string s_originalCorePattern;
 
+#if DUMP_CREATOR_UNIX
+  // Instant systemd-coredump monitor thread (for IMMEDIATE extraction)
+  static std::atomic_bool s_monitorThreadShouldStop;
+  static std::thread s_monitorThread;
+  static pid_t s_applicationPid; // Store PID for filtering core dumps
+#endif
+
+  // Custom signal handlers for graceful shutdown
+  static std::map<int, void (*)(int)> s_customSignalHandlers;
+  static std::mutex s_customHandlersMutex;
+#if DUMP_CREATOR_WINDOWS
+  static BOOL(WINAPI *s_customConsoleHandler)(DWORD);
+#endif
+#if DUMP_CREATOR_UNIX
+  static void (*s_unixConsoleHandler)();
+  static std::atomic_bool s_posixSigThreadStarted;
+#endif
+
   // Instance member variables
   std::string m_dumpDirectory;
   DumpConfiguration m_currentConfig;
@@ -1365,6 +1448,12 @@ private:
   static LONG WINAPI _windowsExceptionHandler(EXCEPTION_POINTERS *pExInfo) noexcept;
 
   /**
+   * @brief Windows console handler wrapper
+   * @details Calls custom console handler if registered
+   */
+  static BOOL WINAPI _windowsConsoleHandler(DWORD ctrlType) noexcept;
+
+  /**
    * @brief Redirected exception filter to prevent removal
    */
   static LONG WINAPI _redirectedSetUnhandledExceptionFilter(EXCEPTION_POINTERS * /*ExceptionInfo*/) noexcept;
@@ -1375,6 +1464,12 @@ private:
    * @brief UNIX-specific signal handler
    */
   static void _unixSignalHandler(int signum) noexcept;
+
+  /**
+   * @brief Wrapper for custom signal handlers
+   * @details Calls custom handler if registered, otherwise calls default crash handler
+   */
+  static void _customSignalHandlerWrapper(int signum) noexcept;
 
   /**
    * @brief Generate core dump on UNIX
@@ -1391,6 +1486,10 @@ private:
    * @brief Setup signal handlers
    */
   static void _setupSignalHandlers();
+  static void _setupPosixGracefulShutdown();
+  // Internal helpers for POSIX graceful shutdown via sigwait
+  static void _posixSigwaitThread();
+  static void _blockDefaultShutdownSignals();
 
   /**
    * @brief Setup core dump settings
@@ -1412,9 +1511,18 @@ private:
    */
   static void _restoreCorePattern();
   /**
-   * @brief Monitor and copy core dumps from systemd-coredump to dumps directory
+   * @brief Monitor and copy core dumps from systemd-coredump to dumps directory (OLD - blocking)
    */
   static void _monitorAndCopyCoreDumps();
+
+  /**
+   * @brief INSTANT systemd-coredump monitor using inotify (runs in background thread)
+   * @details Monitors /var/lib/systemd/coredump/ using Linux inotify API
+   *          Immediately extracts new core dumps to dumps/ directory
+   * @note Requires user in systemd-journal group
+   * @source Official Linux inotify(7) man page
+   */
+  static void _instantSystemdMonitor() noexcept;
 #endif
 
   // Utility functions
@@ -1555,6 +1663,70 @@ bool CoreDumpGenerator::s_initialized = false;
 #endif
 std::string CoreDumpGenerator::s_originalCorePattern;
 DumpConfiguration CoreDumpGenerator::s_currentConfig;
+
+// Custom signal handlers initialization
+std::map<int, void (*)(int)> CoreDumpGenerator::s_customSignalHandlers;
+std::mutex CoreDumpGenerator::s_customHandlersMutex;
+
+#if DUMP_CREATOR_UNIX
+// Instant systemd monitor thread (for IMMEDIATE core dump extraction)
+std::atomic_bool CoreDumpGenerator::s_monitorThreadShouldStop{false};
+std::thread CoreDumpGenerator::s_monitorThread;
+pid_t CoreDumpGenerator::s_applicationPid = getpid(); // Store PID at initialization
+#endif
+#if DUMP_CREATOR_WINDOWS
+BOOL(WINAPI *CoreDumpGenerator::s_customConsoleHandler)(DWORD) = nullptr;
+#endif
+#if DUMP_CREATOR_UNIX
+void (*CoreDumpGenerator::s_unixConsoleHandler)() = nullptr;
+std::atomic_bool CoreDumpGenerator::s_posixSigThreadStarted{};
+
+bool
+CoreDumpGenerator::registerCustomConsoleHandler(void (*handler)()) noexcept
+{
+  try
+  {
+    s_unixConsoleHandler = handler;
+    if(!s_posixSigThreadStarted.exchange(true))
+    {
+      _blockDefaultShutdownSignals();
+      std::thread(_posixSigwaitThread).detach();
+    }
+    return true;
+  }
+  catch(...)
+  {
+    return false;
+  }
+}
+
+void
+CoreDumpGenerator::_blockDefaultShutdownSignals()
+{
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGINT);
+  sigaddset(&set, SIGTERM);
+  sigaddset(&set, SIGHUP);
+  pthread_sigmask(SIG_BLOCK, &set, nullptr);
+}
+
+void
+CoreDumpGenerator::_posixSigwaitThread()
+{
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGINT);
+  sigaddset(&set, SIGTERM);
+  sigaddset(&set, SIGHUP);
+  int sig = 0;
+  if(sigwait(&set, &sig) == 0)
+  {
+    auto callback = s_unixConsoleHandler;
+    if(callback) callback();
+  }
+}
+#endif
 
 // DumpFactory static member definitions
 std::map<DumpType, std::string> const DumpFactory::s_descriptions = {
@@ -1709,41 +1881,41 @@ namespace
     switch(type)
     {
     // Windows mini-dump types
-    case DumpType::MINI_DUMP_NORMAL: return "mini_dump_normal";
-    case DumpType::MINI_DUMP_WITH_DATA_SEGS: return "mini_dump_with_data_segs";
-    case DumpType::MINI_DUMP_WITH_FULL_MEMORY: return "mini_dump_with_full_memory";
-    case DumpType::MINI_DUMP_WITH_HANDLE_DATA: return "mini_dump_with_handle_data";
-    case DumpType::MINI_DUMP_FILTER_MEMORY: return "mini_dump_filter_memory";
-    case DumpType::MINI_DUMP_SCAN_MEMORY: return "mini_dump_scan_memory";
-    case DumpType::MINI_DUMP_WITH_UNLOADED_MODULES: return "mini_dump_with_unloaded_modules";
+    case DumpType::MINI_DUMP_NORMAL:                            return "mini_dump_normal";
+    case DumpType::MINI_DUMP_WITH_DATA_SEGS:                    return "mini_dump_with_data_segs";
+    case DumpType::MINI_DUMP_WITH_FULL_MEMORY:                  return "mini_dump_with_full_memory";
+    case DumpType::MINI_DUMP_WITH_HANDLE_DATA:                  return "mini_dump_with_handle_data";
+    case DumpType::MINI_DUMP_FILTER_MEMORY:                     return "mini_dump_filter_memory";
+    case DumpType::MINI_DUMP_SCAN_MEMORY:                       return "mini_dump_scan_memory";
+    case DumpType::MINI_DUMP_WITH_UNLOADED_MODULES:             return "mini_dump_with_unloaded_modules";
     case DumpType::MINI_DUMP_WITH_INDIRECTLY_REFERENCED_MEMORY: return "mini_dump_with_indirectly_referenced_memory";
-    case DumpType::MINI_DUMP_FILTER_MODULE_PATHS: return "mini_dump_filter_module_paths";
-    case DumpType::MINI_DUMP_WITH_PROCESS_THREAD_DATA: return "mini_dump_with_process_thread_data";
-    case DumpType::MINI_DUMP_WITH_PRIVATE_READ_WRITE_MEMORY: return "mini_dump_with_private_read_write_memory";
-    case DumpType::MINI_DUMP_WITHOUT_OPTIONAL_DATA: return "mini_dump_without_optional_data";
-    case DumpType::MINI_DUMP_WITH_FULL_MEMORY_INFO: return "mini_dump_with_full_memory_info";
-    case DumpType::MINI_DUMP_WITH_THREAD_INFO: return "mini_dump_with_thread_info";
-    case DumpType::MINI_DUMP_WITH_CODE_SEGMENTS: return "mini_dump_with_code_segments";
-    case DumpType::MINI_DUMP_WITHOUT_AUXILIARY_STATE: return "mini_dump_without_auxiliary_state";
-    case DumpType::MINI_DUMP_WITH_FULL_AUXILIARY_STATE: return "mini_dump_with_full_auxiliary_state";
-    case DumpType::MINI_DUMP_WITH_PRIVATE_WRITE_COPY_MEMORY: return "mini_dump_with_private_write_copy_memory";
-    case DumpType::MINI_DUMP_IGNORE_INACCESSIBLE_MEMORY: return "mini_dump_ignore_inaccessible_memory";
-    case DumpType::MINI_DUMP_WITH_TOKEN_INFORMATION: return "mini_dump_with_token_information";
+    case DumpType::MINI_DUMP_FILTER_MODULE_PATHS:               return "mini_dump_filter_module_paths";
+    case DumpType::MINI_DUMP_WITH_PROCESS_THREAD_DATA:          return "mini_dump_with_process_thread_data";
+    case DumpType::MINI_DUMP_WITH_PRIVATE_READ_WRITE_MEMORY:    return "mini_dump_with_private_read_write_memory";
+    case DumpType::MINI_DUMP_WITHOUT_OPTIONAL_DATA:             return "mini_dump_without_optional_data";
+    case DumpType::MINI_DUMP_WITH_FULL_MEMORY_INFO:             return "mini_dump_with_full_memory_info";
+    case DumpType::MINI_DUMP_WITH_THREAD_INFO:                  return "mini_dump_with_thread_info";
+    case DumpType::MINI_DUMP_WITH_CODE_SEGMENTS:                return "mini_dump_with_code_segments";
+    case DumpType::MINI_DUMP_WITHOUT_AUXILIARY_STATE:           return "mini_dump_without_auxiliary_state";
+    case DumpType::MINI_DUMP_WITH_FULL_AUXILIARY_STATE:         return "mini_dump_with_full_auxiliary_state";
+    case DumpType::MINI_DUMP_WITH_PRIVATE_WRITE_COPY_MEMORY:    return "mini_dump_with_private_write_copy_memory";
+    case DumpType::MINI_DUMP_IGNORE_INACCESSIBLE_MEMORY:        return "mini_dump_ignore_inaccessible_memory";
+    case DumpType::MINI_DUMP_WITH_TOKEN_INFORMATION:            return "mini_dump_with_token_information";
 
     // Windows kernel-mode dump types
-    case DumpType::KERNEL_FULL_DUMP: return "kernel_full_dump";
-    case DumpType::KERNEL_KERNEL_DUMP: return "kernel_kernel_dump";
-    case DumpType::KERNEL_SMALL_DUMP: return "kernel_small_dump";
-    case DumpType::KERNEL_AUTOMATIC_DUMP: return "kernel_automatic_dump";
-    case DumpType::KERNEL_ACTIVE_DUMP: return "kernel_active_dump";
+    case DumpType::KERNEL_FULL_DUMP:                            return "kernel_full_dump";
+    case DumpType::KERNEL_KERNEL_DUMP:                          return "kernel_kernel_dump";
+    case DumpType::KERNEL_SMALL_DUMP:                           return "kernel_small_dump";
+    case DumpType::KERNEL_AUTOMATIC_DUMP:                       return "kernel_automatic_dump";
+    case DumpType::KERNEL_ACTIVE_DUMP:                          return "kernel_active_dump";
 
     // UNIX core dump types
-    case DumpType::CORE_DUMP_FULL: return "core_dump_full";
+    case DumpType::CORE_DUMP_FULL:                              return "core_dump_full";
 
     // Default types
-    case DumpType::DEFAULT_AUTO: return "default_auto";
+    case DumpType::DEFAULT_AUTO:                                return "default_auto";
 
-    default: return "unknown_dump_type";
+    default:                                                    return "unknown_dump_type";
     }
   }
 } // namespace
@@ -2055,11 +2227,92 @@ CoreDumpGenerator::isAdminPrivileges() noexcept
 #if DUMP_CREATOR_WINDOWS
   return _isAdminPrivileges();
 #elif DUMP_CREATOR_UNIX
-  return (getuid() == 0);
+  // Check if user is root
+  if(getuid() == 0) return true;
+
+  // Check if user is in peakexpert group (installation group with elevated privileges)
+  // This allows showing full paths in logs for peakexpert group members
+  struct group *peakexpert_group = getgrnam("peakexpert");
+  if(peakexpert_group != nullptr)
+  {
+    gid_t peakexpert_gid = peakexpert_group->gr_gid;
+
+    // Get all groups for current user
+    int ngroups = 0;
+    getgroups(0, nullptr); // Get number of groups
+    ngroups = getgroups(0, nullptr);
+    if(ngroups > 0)
+    {
+      std::vector<gid_t> groups(ngroups);
+      if(getgroups(ngroups, groups.data()) != -1)
+      {
+        // Check if peakexpert group is in the list
+        for(int i = 0; i < ngroups; i++)
+          if(groups[i] == peakexpert_gid) return true; // User is in peakexpert group
+      }
+    }
+  }
+
+  return false;
 #else
   return false; // Unsupported platform
 #endif
 }
+
+bool
+CoreDumpGenerator::registerCustomSignalHandler(int signum, void (*handler)(int)) noexcept
+{
+#if DUMP_CREATOR_UNIX
+  try
+  {
+    std::lock_guard<std::mutex> lock(s_customHandlersMutex);
+    s_customSignalHandlers[signum] = handler;
+
+    // Register the signal with our wrapper handler
+    struct sigaction sa;
+    sa.sa_handler = _customSignalHandlerWrapper;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+
+    if(sigaction(signum, &sa, nullptr) == 0)
+    {
+      _logMessage("Custom signal handler registered for signal " + std::to_string(signum), false);
+      return true;
+    }
+    else
+    {
+      s_customSignalHandlers.erase(signum);
+      return false;
+    }
+  }
+  catch(...)
+  {
+    return false;
+  }
+#else
+  // Windows doesn't use signal handlers for graceful shutdown
+  (void)signum;  // Suppress unused parameter warning
+  (void)handler; // Suppress unused parameter warning
+  return false;
+#endif
+}
+
+#if DUMP_CREATOR_WINDOWS
+bool
+CoreDumpGenerator::registerCustomConsoleHandler(BOOL(WINAPI *handler)(DWORD)) noexcept
+{
+  try
+  {
+    s_customConsoleHandler = handler;
+    _logMessage("Custom console handler registered", false);
+    return true;
+  }
+  catch(...)
+  {
+    return false;
+  }
+}
+#endif
 
 // Instance methods implementation
 std::string const &
@@ -2237,7 +2490,79 @@ CoreDumpGenerator::_platformInitialize()
 #elif DUMP_CREATOR_UNIX
   _setupSignalHandlers();
   _setupCoreDumpSettings();
+
+  // Store orig core_pattern BEFORE attempting to change it
   _setupCorePattern();
+  std::string pattern_before_change = s_originalCorePattern;
+
+  // Try to set custom core_pattern via sudo (primary mechanism)
+  _generateCoreDump();
+
+  // Verify if core_pattern actually changed with kernel specifiers
+  std::ifstream check_pattern("/proc/sys/kernel/core_pattern");
+  std::string pattern_after_change;
+
+  if(std::getline(check_pattern, pattern_after_change))
+  {
+    // Check for our pattern with kernel specifiers: %t, %p, %e
+    bool has_kernel_specifiers
+      = (pattern_after_change.find("%t") != std::string::npos && pattern_after_change.find("%p") != std::string::npos
+         && pattern_after_change.find("%e") != std::string::npos);
+
+    bool has_our_directory = (pattern_after_change.find(s_dumpDirectory) != std::string::npos);
+
+    if(has_kernel_specifiers && has_our_directory)
+    {
+      _logMessage("SUCCESS: Custom core_pattern set successfully", false);
+      _logMessage("  Dumps will be created directly in: " + s_dumpDirectory, false);
+      _logMessage("  Pattern: " + pattern_after_change, false);
+    }
+    else
+    {
+      _logMessage("WARNING: core_pattern did not change to our pattern (sudo likely failed)", false);
+
+      // Try to restore original systemd-coredump pattern if it was active before
+      // This prevents leaving stale pattern from previous run
+      if(!pattern_before_change.empty() && pattern_before_change[0] == '|'
+         && pattern_before_change.find("systemd-coredump") != std::string::npos)
+      {
+        _logMessage("INFO: Attempting to restore original systemd-coredump pattern", false);
+        std::string restore_cmd
+          = "echo \"" + pattern_before_change + "\" | sudo tee /proc/sys/kernel/core_pattern >/dev/null 2>&1";
+        int restore_ret = system(restore_cmd.c_str());
+
+        if(restore_ret == 0)
+        {
+          _logMessage("INFO: Successfully restored systemd-coredump pattern", false);
+          pattern_after_change = pattern_before_change; // Update for subsequent checks
+        }
+      }
+
+      // Check if systemd-coredump is active (either originally or after restore)
+      if(!pattern_after_change.empty() && pattern_after_change[0] == '|'
+         && pattern_after_change.find("systemd-coredump") != std::string::npos)
+      {
+        // systemd-coredump is active -> start fallback monitor
+        try
+        {
+          s_monitorThreadShouldStop.store(false, std::memory_order_release);
+          s_monitorThread = std::thread(_instantSystemdMonitor);
+          _logMessage("INFO: Using systemd-coredump with instant extraction fallback", false);
+          _logMessage("  Dumps will be extracted from systemd to: " + s_dumpDirectory, false);
+        }
+        catch(std::exception const &exc)
+        {
+          _logMessage("Failed to start systemd fallback monitor: " + std::string(exc.what()), true);
+        }
+      }
+      else
+      {
+        _logMessage("WARNING: Using system default core_pattern", false);
+        _logMessage("  Current pattern: " + pattern_after_change, false);
+        _logMessage("  Dumps may be created in current directory or other system location", false);
+      }
+    }
+  }
 
 #endif
 }
@@ -2252,6 +2577,9 @@ CoreDumpGenerator::_setupWindowsHandlers()
   {
     // Set our exception handler
     SetUnhandledExceptionFilter(_windowsExceptionHandler);
+
+    // Register console handler for graceful shutdown
+    SetConsoleCtrlHandler(_windowsConsoleHandler, TRUE);
 
     // Redirect SetUnhandledExceptionFilter to prevent removal
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
@@ -2455,6 +2783,16 @@ CoreDumpGenerator::_redirectedSetUnhandledExceptionFilter(EXCEPTION_POINTERS * /
   return 0;
 }
 
+BOOL WINAPI
+CoreDumpGenerator::_windowsConsoleHandler(DWORD ctrlType) noexcept
+{
+  // Call custom console handler if registered
+  if(s_customConsoleHandler != nullptr) return s_customConsoleHandler(ctrlType);
+
+  // Default behavior - let the system handle it
+  return FALSE;
+}
+
 bool
 CoreDumpGenerator::_createWindowsDump(std::string const &filename, DumpConfiguration const &config)
 {
@@ -2576,25 +2914,25 @@ CoreDumpGenerator::_getMinidumpType(DumpType type) noexcept
   switch(type)
   {
   // Basic mini-dump types (single flags)
-  case DumpType::MINI_DUMP_NORMAL: return MiniDumpNormal;
-  case DumpType::MINI_DUMP_WITH_DATA_SEGS: return MiniDumpWithDataSegs;
-  case DumpType::MINI_DUMP_WITH_HANDLE_DATA: return MiniDumpWithHandleData;
-  case DumpType::MINI_DUMP_FILTER_MEMORY: return MiniDumpFilterMemory;
-  case DumpType::MINI_DUMP_SCAN_MEMORY: return MiniDumpScanMemory;
-  case DumpType::MINI_DUMP_WITH_UNLOADED_MODULES: return MiniDumpWithUnloadedModules;
+  case DumpType::MINI_DUMP_NORMAL:                            return MiniDumpNormal;
+  case DumpType::MINI_DUMP_WITH_DATA_SEGS:                    return MiniDumpWithDataSegs;
+  case DumpType::MINI_DUMP_WITH_HANDLE_DATA:                  return MiniDumpWithHandleData;
+  case DumpType::MINI_DUMP_FILTER_MEMORY:                     return MiniDumpFilterMemory;
+  case DumpType::MINI_DUMP_SCAN_MEMORY:                       return MiniDumpScanMemory;
+  case DumpType::MINI_DUMP_WITH_UNLOADED_MODULES:             return MiniDumpWithUnloadedModules;
   case DumpType::MINI_DUMP_WITH_INDIRECTLY_REFERENCED_MEMORY: return MiniDumpWithIndirectlyReferencedMemory;
-  case DumpType::MINI_DUMP_FILTER_MODULE_PATHS: return MiniDumpFilterModulePaths;
-  case DumpType::MINI_DUMP_WITH_PROCESS_THREAD_DATA: return MiniDumpWithProcessThreadData;
-  case DumpType::MINI_DUMP_WITH_PRIVATE_READ_WRITE_MEMORY: return MiniDumpWithPrivateReadWriteMemory;
-  case DumpType::MINI_DUMP_WITHOUT_OPTIONAL_DATA: return MiniDumpWithoutOptionalData;
-  case DumpType::MINI_DUMP_WITH_FULL_MEMORY_INFO: return MiniDumpWithFullMemoryInfo;
-  case DumpType::MINI_DUMP_WITH_THREAD_INFO: return MiniDumpWithThreadInfo;
-  case DumpType::MINI_DUMP_WITH_CODE_SEGMENTS: return MiniDumpWithCodeSegs;
-  case DumpType::MINI_DUMP_WITHOUT_AUXILIARY_STATE: return MiniDumpWithoutAuxiliaryState;
-  case DumpType::MINI_DUMP_WITH_FULL_AUXILIARY_STATE: return MiniDumpWithFullAuxiliaryState;
-  case DumpType::MINI_DUMP_WITH_PRIVATE_WRITE_COPY_MEMORY: return MiniDumpWithPrivateWriteCopyMemory;
-  case DumpType::MINI_DUMP_IGNORE_INACCESSIBLE_MEMORY: return MiniDumpIgnoreInaccessibleMemory;
-  case DumpType::MINI_DUMP_WITH_TOKEN_INFORMATION: return MiniDumpWithTokenInformation;
+  case DumpType::MINI_DUMP_FILTER_MODULE_PATHS:               return MiniDumpFilterModulePaths;
+  case DumpType::MINI_DUMP_WITH_PROCESS_THREAD_DATA:          return MiniDumpWithProcessThreadData;
+  case DumpType::MINI_DUMP_WITH_PRIVATE_READ_WRITE_MEMORY:    return MiniDumpWithPrivateReadWriteMemory;
+  case DumpType::MINI_DUMP_WITHOUT_OPTIONAL_DATA:             return MiniDumpWithoutOptionalData;
+  case DumpType::MINI_DUMP_WITH_FULL_MEMORY_INFO:             return MiniDumpWithFullMemoryInfo;
+  case DumpType::MINI_DUMP_WITH_THREAD_INFO:                  return MiniDumpWithThreadInfo;
+  case DumpType::MINI_DUMP_WITH_CODE_SEGMENTS:                return MiniDumpWithCodeSegs;
+  case DumpType::MINI_DUMP_WITHOUT_AUXILIARY_STATE:           return MiniDumpWithoutAuxiliaryState;
+  case DumpType::MINI_DUMP_WITH_FULL_AUXILIARY_STATE:         return MiniDumpWithFullAuxiliaryState;
+  case DumpType::MINI_DUMP_WITH_PRIVATE_WRITE_COPY_MEMORY:    return MiniDumpWithPrivateWriteCopyMemory;
+  case DumpType::MINI_DUMP_IGNORE_INACCESSIBLE_MEMORY:        return MiniDumpIgnoreInaccessibleMemory;
+  case DumpType::MINI_DUMP_WITH_TOKEN_INFORMATION:            return MiniDumpWithTokenInformation;
 
   // Full memory dump (combination of flags for maximum information)
   case DumpType::MINI_DUMP_WITH_FULL_MEMORY:
@@ -2783,6 +3121,187 @@ CoreDumpGenerator::_restoreCorePattern()
 }
 
 void
+CoreDumpGenerator::_instantSystemdMonitor() noexcept
+{
+  // INSTANT core dump extraction using Linux inotify API
+  // Source: inotify(7) man page - official Linux kernel documentation
+  // Monitors /var/lib/systemd/coredump/ for new files and extracts IMMEDIATELY (< 1 sec)
+
+  try
+  {
+    char const *systemd_coredump_dir = "/var/lib/systemd/coredump";
+
+    // Check if systemd-coredump directory exists and accessible
+    struct stat st;
+    if(stat(systemd_coredump_dir, &st) != 0)
+    {
+      _logMessage("systemd-coredump directory not accessible - skipping instant monitor", false);
+      return;
+    }
+
+    // Initialize inotify (non-blocking mode)
+    int inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if(inotify_fd < 0)
+    {
+      _logMessage("Failed to initialize inotify", true);
+      return;
+    }
+
+    // Watch for new files (IN_CREATE) and moved files (IN_MOVED_TO)
+    int watch_fd = inotify_add_watch(inotify_fd, systemd_coredump_dir, IN_CREATE | IN_MOVED_TO);
+    if(watch_fd < 0)
+    {
+      close(inotify_fd);
+      _logMessage("Failed to add inotify watch on systemd-coredump", true);
+      return;
+    }
+
+    _logMessage("INSTANT systemd-coredump monitor ACTIVE (inotify-based)", false);
+    _logMessage("   - Monitoring: " + std::string(systemd_coredump_dir), false);
+    _logMessage("   - Will extract dumps IMMEDIATELY upon creation (<1 sec)", false);
+    _logMessage("   - Target directory: " + s_dumpDirectory, false);
+
+    // Event buffer (aligned for inotify_event structure)
+    char event_buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+
+    while(!s_monitorThreadShouldStop.load(std::memory_order_acquire))
+    {
+      // Use select() for timeout support (allows clean shutdown)
+      fd_set readfds;
+      FD_ZERO(&readfds);
+      FD_SET(inotify_fd, &readfds);
+
+      struct timeval timeout;
+      timeout.tv_sec  = 1; // 1 second timeout
+      timeout.tv_usec = 0;
+
+      int select_ret  = select(inotify_fd + 1, &readfds, nullptr, nullptr, &timeout);
+
+      if(select_ret > 0 && FD_ISSET(inotify_fd, &readfds))
+      {
+        // Read inotify events
+        ssize_t len = read(inotify_fd, event_buffer, sizeof(event_buffer));
+
+        if(len > 0)
+        {
+          // Process all events in buffer
+          const struct inotify_event *event;
+          for(char *ptr = event_buffer; ptr < event_buffer + len; ptr += sizeof(struct inotify_event) + event->len)
+          {
+            event = reinterpret_cast<const struct inotify_event *>(ptr);
+
+            // Check if this is a new file creation or move
+            if((event->mask & (IN_CREATE | IN_MOVED_TO)) && event->len > 0)
+            {
+              std::string filename = event->name;
+
+              // Auto-detect executable name from /proc/self/exe (UNIVERSAL)
+              static std::string exe_name;
+              if(exe_name.empty())
+              {
+                char buf[PATH_MAX];
+                ssize_t exe_len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+                if(exe_len != -1)
+                {
+                  buf[exe_len]     = '\0';
+                  char const *base = strrchr(buf, '/');
+                  exe_name         = base ? (base + 1) : buf;
+                }
+                else
+                {
+                  exe_name = "unknown"; // Fallback if readlink fails
+                }
+              }
+
+              // Filter for our application's core dumps only
+              // Format: core.<exe_name>.{uid}.{boot-id}.{pid}.{timestamp}.zst
+              std::string core_prefix = "core." + exe_name;
+              if(filename.find(core_prefix) != std::string::npos)
+              {
+                _logMessage("NEW CORE DUMP DETECTED: " + filename, false);
+
+                // Give systemd-coredump time to finish writing and compressing
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                // Generate target filename with timestamp
+                std::string timeStr     = formatTime("%d.%m.%Y.%H.%M.%S");
+                std::string target_file = s_dumpDirectory + "/core_dump_full_" + timeStr + ".core";
+
+                // Extract using coredumpctl (works without sudo if user in systemd-journal group)
+                // Use auto-detected executable name for universal compatibility
+                std::string extract_cmd = "coredumpctl dump " + exe_name + " --output=\"" + target_file + "\" 2>&1";
+
+                _logMessage("EXTRACTING IMMEDIATELY to: " + target_file, false);
+
+                FILE *pipe = popen(extract_cmd.c_str(), "r");
+                if(pipe)
+                {
+                  char cmd_buffer[512];
+                  std::string cmd_output;
+                  while(fgets(cmd_buffer, sizeof(cmd_buffer), pipe)) cmd_output += cmd_buffer;
+
+                  int exit_code = pclose(pipe);
+                  if(exit_code == 0)
+                  {
+                    // Verify extraction success
+                    struct stat dump_stat;
+                    if(stat(target_file.c_str(), &dump_stat) == 0)
+                    {
+                      double size_mb = static_cast<double>(dump_stat.st_size) / (1024.0 * 1024.0);
+                      _logMessage("SUCCESS: Core dump extracted INSTANTLY!", false);
+                      _logMessage("   File: " + target_file, false);
+                      _logMessage("   Size: " + std::to_string(size_mb) + " MB (" + std::to_string(dump_stat.st_size)
+                                    + " bytes)",
+                                  false);
+                      _logMessage("   Extraction time: <1 second after crash", false);
+
+                      // Set proper permissions (readable by user and admin group)
+                      chmod(target_file.c_str(), 0640);
+                    }
+                    else { _logMessage("File extracted but stat() failed", true); }
+                  }
+                  else
+                  {
+                    _logMessage("coredumpctl failed (exit code: " + std::to_string(exit_code) + ")", true);
+                    if(!cmd_output.empty()) _logMessage("   Output: " + cmd_output, true);
+                    _logMessage("   Ensure user is in 'systemd-journal' group: sudo usermod -aG systemd-journal $USER",
+                                true);
+                  }
+                }
+                else { _logMessage("Failed to execute coredumpctl command", true); }
+              }
+            }
+          }
+        }
+        else if(len < 0 && errno != EAGAIN)
+        {
+          _logMessage("inotify read error: " + std::string(strerror(errno)), true);
+          break;
+        }
+      }
+      else if(select_ret < 0 && errno != EINTR)
+      {
+        _logMessage("select() error in systemd monitor: " + std::string(strerror(errno)), true);
+        break;
+      }
+    }
+
+    // Cleanup
+    inotify_rm_watch(inotify_fd, watch_fd);
+    close(inotify_fd);
+    _logMessage("Instant systemd monitor stopped cleanly", false);
+  }
+  catch(std::exception const &exc)
+  {
+    _logMessage("Exception in instant systemd monitor: " + std::string(exc.what()), true);
+  }
+  catch(...)
+  {
+    _logMessage("Unknown exception in instant systemd monitor", true);
+  }
+}
+
+void
 CoreDumpGenerator::_monitorAndCopyCoreDumps()
 {
   try
@@ -2856,6 +3375,25 @@ CoreDumpGenerator::_unixSignalHandler(int signum) noexcept
   raise(signum);
 }
 
+void
+CoreDumpGenerator::_customSignalHandlerWrapper(int signum) noexcept
+{
+  // Check if we have a custom handler for this signal
+  std::lock_guard<std::mutex> lock(s_customHandlersMutex);
+  auto it = s_customSignalHandlers.find(signum);
+
+  if(it != s_customSignalHandlers.end())
+  {
+    // Call custom handler
+    it->second(signum);
+  }
+  else
+  {
+    // No custom handler, use default crash behavior
+    _unixSignalHandler(signum);
+  }
+}
+
 // Helper function to check and log core dump file size
 void
 CoreDumpGenerator::_logCoreDumpSize(std::string const &filename) noexcept
@@ -2899,14 +3437,17 @@ CoreDumpGenerator::_generateCoreDump()
     // Create dump directory
     mkdir(s_dumpDirectory.c_str(), 0755);
 
-    // Generate filename with current time (like in working example)
-    auto t  = std::time(nullptr);
-    auto tm = *std::localtime(&t);
+    // Generate core_pattern using kernel specifiers
+    // %t - timestamp of crash (NOT initialization!)
+    // %p - PID of crashing process
+    // %e - executable name
+    // Source: core(5) man page - official Linux documentation
     std::ostringstream filename;
-    filename << s_dumpDirectory << "/core_dump_full_" << std::put_time(&tm, "%d.%m.%Y.%H.%M.%S") << ".core";
+    filename << s_dumpDirectory << "/core_dump_full_%t_%p_%e.core";
 
-    std::string core_filename = filename.str();
-    _logMessage("Core dump will be created: " + core_filename, false);
+    std::string core_pattern = filename.str();
+    _logMessage("Core dump pattern: " + core_pattern, false);
+    _logMessage("  %t = crash timestamp, %p = PID, %e = executable name", false);
 
     // Set core dump size limit
     struct rlimit core_limit;
@@ -2914,13 +3455,34 @@ CoreDumpGenerator::_generateCoreDump()
     core_limit.rlim_max = RLIM_INFINITY;
     setrlimit(RLIMIT_CORE, &core_limit);
 
-    // Set core pattern to create file with our name (like in working example)
-    std::string core_pattern_cmd = "echo \"" + core_filename + "\" | sudo tee /proc/sys/kernel/core_pattern";
+    // Set core pattern to create file with our name (PRIMARY mechanism: sudo tee)
+    std::string core_pattern_cmd = "echo \"" + core_pattern + "\" | sudo tee /proc/sys/kernel/core_pattern";
     int ret                      = system(core_pattern_cmd.c_str());
+
     if(ret != 0)
-      _logMessage("Failed to set core pattern - will use system default", true);
-    else
-      _logMessage("Core pattern set successfully", false);
+    {
+      _logMessage("WARNING: sudo tee failed, attempting direct write", true);
+
+      // Try direct write (will fail on most systems but worth trying)
+      int fd = open("/proc/sys/kernel/core_pattern", O_WRONLY | O_TRUNC);
+      if(fd >= 0)
+      {
+        ssize_t written = write(fd, core_pattern.c_str(), core_pattern.length());
+        close(fd);
+        if(written > 0)
+        {
+          _logMessage("Direct write successful (no sudo required)", false);
+          _logMessage("Core dump generation configured", false);
+          return;
+        }
+      }
+
+      _logMessage("WARNING: Cannot set custom core_pattern - will use system default", true);
+      _logMessage("  Core dumps will be handled by systemd-coredump if available", false);
+      _logMessage("  or created as './core' in current directory", false);
+      _logMessage("  systemd-coredump fallback monitor will extract dumps if active", false);
+    }
+    else { _logMessage("Core pattern set successfully via sudo", false); }
 
     _logMessage("Core dump generation configured", false);
   }
@@ -3358,11 +3920,11 @@ CoreDumpGenerator::_logMessage(std::string const &message, bool isError)
 
     oss << "[" << timeStr << "] " << (isError ? "ERROR" : "INFO") << ": " << sanitizedMessage;
 
-    // Standard console output
+    // Standard console output with explicit flush (unbuffered for immediate visibility)
     if(isError)
-      std::cerr << oss.str() << '\n';
+      std::cerr << oss.str() << std::endl;
     else
-      std::cout << oss.str() << '\n';
+      std::cout << oss.str() << std::endl;
   }
   catch(std::exception const &exc)
   {
